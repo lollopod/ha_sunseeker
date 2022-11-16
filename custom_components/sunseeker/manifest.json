@@ -1,0 +1,14 @@
+{
+  "domain": "sunseeker",
+  "integration_type": "hub",
+  "name": "SunSeeker",
+  "version": "1.2.0",
+  "documentation": "https://github.com/lollopod/ha-sunseeker",
+  "issue_tracker": "https://github.com/lollopod/ha-sunseeker/issues",
+  "dependencies": [ ],
+  "codeowners": [
+    "@lollopod"
+  ],
+  "requirements": [ ],
+  "iot_class": "cloud_polling"
+}
