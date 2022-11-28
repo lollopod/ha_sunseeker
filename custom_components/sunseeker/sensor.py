@@ -4,19 +4,21 @@ For more details about this component, please refer to the documentation at
 https://github.com/lollopod/ha-sunseeker
 """
 from datetime import timedelta
-import json
 import logging
 
 import async_timeout
 from pyowm.owm import OWM
-from requests.models import PreparedRequest
+from pyowm.config import DEFAULT_CONFIG as OWM_DEFAULT_CONFIG
 import voluptuous as vol
 
-from config.custom_components.sunseeker.const import DIREKT_BAHN_BASE_URL
+from .const import DIREKT_BAHN_BASE_URL
 
 # from homeassistant.helpers.entity import Entity
 from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity
 from homeassistant.core import callback
+from homeassistant.components.openweathermap.weather_update_coordinator import (
+    WeatherUpdateCoordinator,
+)
 
 # from homeassistant.exceptions import PlatformNotReady
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
@@ -27,7 +29,8 @@ from homeassistant.helpers.update_coordinator import (
     UpdateFailed,
 )
 
-CONF_DEPARTURE_STATION = "departure_station"
+# CONF_DEPARTURE_STATION = "departure_station"
+CONF_DEPARTURE_STATION_ID = "departure_station_id"
 CONF_OWM_API_KEY = "owm_api_key"
 CONF_OWM_DECISION_PARAMETER = "owm_decision_parameter"
 CONF_OWM_DECISION_THRESHOLD = "owm_decision_threshold"
@@ -40,7 +43,8 @@ SCAN_INTERVAL = timedelta(hours=6)
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_DEPARTURE_STATION, default=None): cv.string,
+        # vol.Required(CONF_DEPARTURE_STATION, default=None): cv.string,
+        vol.Required(CONF_DEPARTURE_STATION_ID, default=None): cv.Number,
         vol.Required(CONF_OWM_API_KEY, default=None): cv.string,
         vol.Optional(CONF_OWM_DECISION_PARAMETER, default="clouds"): cv.string,
         vol.Optional(CONF_OWM_DECISION_THRESHOLD, default=10): cv.Number,
@@ -64,25 +68,20 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
         "forecast": config.get(CONF_OWM_FORECAST),
     }
 
-    station = config.get(CONF_DEPARTURE_STATION)
+    station_id = config.get(CONF_DEPARTURE_STATION_ID)
 
-    api = DBAPI(async_create_clientsession(hass), hass.loop, station)
-    sunseeker = weatherFinder(
-        async_create_clientsession(hass), hass.loop, station, owm_params
-    )
-    coordinator = WeatherCoordinator(hass, api, sunseeker, config)
+    destination_number = config.get(CONF_DESTINATION_NUMBER)
 
-    # finder_coordinator = FinderCoordinator(hass, sunseeker, config)
+    async_session = async_create_clientsession(hass)
 
-    # data = await api.get_json()
-    # _LOGGER.debug(len(data["journey"]))
+    db_api = DBAPI(async_session, hass.loop, station_id)
 
-    await coordinator.async_config_entry_first_refresh()
+    # if sunseeker wants to retreive the list of stations, DBAPI can be called, but it should be sufficient to call once or very rarely
+    # so for the moment I put this in the initialization of sunseeker? Makes sense...
 
-    if config.get(CONF_KLIMATICKET) and sunseeker.checkStationCountry(
-        coordinator.dp_api.departure_station
-    ):
-        _LOGGER.error("Station outside Austria, but klimaticket option is active")
+    sunseeker = weatherFinder(hass, db_api, owm_params)
+
+    coordinator = WeatherCoordinator(hass, sunseeker, destination_number)
 
     devices = []
 
@@ -91,32 +90,86 @@ async def async_setup_platform(hass, config, add_devices_callback, discovery_inf
     add_devices_callback(devices, True)
 
 
+class DBAPI:
+    """Call API."""
+
+    def __init__(self, session, loop, station_id):
+        """Initialize."""
+        self.loop = loop
+        self.session = session
+
+        self.data = {}
+
+        self.url = DIREKT_BAHN_BASE_URL + "/" + str(station_id)
+        self.stations_url = DIREKT_BAHN_BASE_URL + "/stations/" + str(station_id)
+
+    async def async_fetch_data(self):
+        """Get json from API endpoint."""
+        value = None
+
+        _LOGGER.debug("Inside fetch")
+
+        # try:
+        async with self.session.get(self.url) as resp:
+            value = await resp.json()
+
+        # except Exception:
+        # pass
+
+        return value
+
+    async def fetch_station(self):
+        """Get json from API endpoint."""
+        value = None
+
+        _LOGGER.debug("Inside fetch")
+
+        try:
+            async with self.session.get(self.stations_url) as resp:
+                value = await resp.json()
+
+        except Exception:
+            pass
+
+        return value
+
+
 class weatherFinder:
     """Checks and finds good weather"""
 
-    def __init__(self, session, loop, station, owm_params):
+    def __init__(self, hass, db_api: DBAPI, owm_params):
         """Initialize"""
-        self.dbgendpoint = DIREKT_BAHN_BASE_URL
-        self.loop = loop
-        self.session = session
+
         self.data = {}
-        self.stationName = station
         self.owm_params = owm_params
 
-        self.owm = OWM(owm_params["api-key"])
-        self.owmMgr = self.owm.weather_manager()
+        owm_config = OWM_DEFAULT_CONFIG
+        owm_config["connection"]["timeout_secs"] = 60
 
-    def getWeatherAtStation(self, station):
-        """Retreives weather info"""
-        return self.owmMgr.one_call(
-            lat=station["location"]["latitude"], lon=station["location"]["longitude"]
-        )
+        self.owm = OWM(owm_params["api-key"], owm_config)
+        self.owmMgr = self.owm.weather_manager()
+        self.train_data = None
+        self.db_api = db_api
+
+        self.hass = hass
+
+    # def _getWeatherAtStation(self, station):
+    #     """Retreives weather info"""
+    #     weather = None
+
+    #     weather = self.owmMgr.one_call(
+    #         lat=station["location"]["latitude"],
+    #         lon=station["location"]["longitude"],
+    #     )
+
+    # return weather
 
     def checkWeatherAtStation(self, station):
         """Checks if weather matches target weather"""
-        Weather = self.getWeatherAtStation(station)
+        # weather = self._getWeatherAtStation(station)
 
-        forecast = getattr(Weather, self.owm_params["forecast"])
+        owm_data = []
+        forecast = getattr(owm_data, self.owm_params["forecast"])
         status = getattr(forecast, self.owm_params["decison-parameter"])
 
         if status <= self.owm_params["decision-threshold"]:
@@ -125,88 +178,90 @@ class weatherFinder:
         else:
             return (0, forecast)  # no sun
 
+    async def async_checkWeatherAtStation(self, station):
+        """Checks if weather matches target weather"""
+        # weather = self._getWeatherAtStation(station)
+
+        owm_coordinator = WeatherUpdateCoordinator(
+            self.owmMgr,
+            station["location"]["latitude"],
+            station["location"]["longitude"],
+            self.owm_params["forecast"],
+            self.hass,
+        )
+
+        await owm_coordinator.async_config_entry_first_refresh()
+
+        # forecast = getattr(owm_coordinator.data, self.owm_params["forecast"])
+        # status = getattr(forecast, self.owm_params["decison-parameter"])
+
+        # if status <= self.owm_params["decision-threshold"]:
+        #     # parameter to be selected here, I think I will choose cloudiness
+        #     return (1, forecast)  # sun has been found
+        # else:
+        #     return (0, forecast)  # no sun
+
+    def find_sunny_stations(self, sunny_stations_number):
+        """Checks if weather matches target weather"""
+        sunny_stations = []
+
+        # async with async_timeout.timeout(30):
+
+        for station in self.train_data:
+            (sunnyThere, forecast) = self.checkWeatherAtStation(station)
+            if sunnyThere:
+                station["forecast"] = forecast
+                sunny_stations.append(station)
+                if len(sunny_stations) > sunny_stations_number:
+                    break
+        return sunny_stations
+
+    async def async_find_sunny_stations(self, sunny_stations_number):
+        """Checks if weather matches target weather"""
+        sunny_stations = []
+
+        # async with async_timeout.timeout(30):
+
+        for station in self.train_data:
+            (sunnyThere, forecast) = await self.async_checkWeatherAtStation(station)
+            if sunnyThere:
+                station["forecast"] = forecast
+                sunny_stations.append(station)
+                if len(sunny_stations) > sunny_stations_number:
+                    break
+        return sunny_stations
+
     def checkStationCountry(self, station):
         """Checks if the station is is Austria"""
-        station = self.session.get(
-            self.dbgendpoint + "/stations/" + station["id"]
-        ).json()
         # I can eventually check if the country is Austria (I could also do this upfront for all the stations)
         if station["country"] != "AT":
             return -1
         else:
             return 0
 
+    async def update_train_data(self):
+        # store internally all the stations
+        async with async_timeout.timeout(20):
+            self.train_data = await self.db_api.async_fetch_data()
 
-class DBAPI:
-    """Call API."""
-
-    def __init__(self, session, loop, station):
-        """Initialize."""
-        self.params = {"query": station}
-        self.loop = loop
-        self.session = session
-
-        self.data = {}
-
-        station_req = PreparedRequest()
-        station_req.prepare_url(DIREKT_BAHN_BASE_URL + "/stations", self.params)
-        self.station_url = station_req.url
-
-        self._attr_unique_id = self.station_url
-
-        self.departure_station = self.get_dep_station()
-
-        self.data_url = DIREKT_BAHN_BASE_URL + "/" + str(self.departure_station)
-
-    async def fetch_data(self):
-        """Get json from API endpoint."""
-        value = None
-
-        _LOGGER.debug("Inside fetch")
-
-        try:
-            async with async_timeout.timeout(10):
-
-                value = await self.session.get(self.data_url)
-
-        except Exception:
-            pass
-
-        return value
-
-    async def get_dep_station(self):
-        """Get json from API endpoint."""
-        value = None
-
-        try:
-            async with async_timeout.timeout(10):
-
-                response = await self.session.get(self.station_url)
-
-                value = response[0]
-
-        except Exception:
-            pass
-
-        return value
+        return 1
 
 
 class WeatherCoordinator(DataUpdateCoordinator):
     """My custom coordinator."""
 
-    def __init__(self, hass, db_api: DBAPI, sunseeker: weatherFinder, config):
+    def __init__(self, hass, sunseeker: weatherFinder, destination_number):
         """Initialize my coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             # Name of the data. For logging purposes.
-            name="My sensor",
+            name="SunSeeker",
             # Polling interval. Will only be polled if there are subscribers.
             update_interval=timedelta(seconds=30),
         )
-        self.dp_api = db_api
         self.sunseeker = sunseeker
-        self.config = config
+        self.destination_number = destination_number
 
     async def _async_update_data(self):
         """Fetch data from API endpoint.
@@ -215,33 +270,20 @@ class WeatherCoordinator(DataUpdateCoordinator):
         so entities can quickly look up their data.
         """
         sunny_stations = []
+        # try:
 
-        try:
-            # Note: asyncio.TimeoutError and aiohttp.ClientError are already
-            # handled by the data update coordinator.
-            async with async_timeout.timeout(1000):
-                data = await self.dp_api.fetch_data()
-                for station in data:
-                    if self.config.get(
-                        CONF_KLIMATICKET
-                    ) and self.sunseeker.checkStationCountry(
-                        self.dp_api.departure_station
-                    ):
-                        _LOGGER.debug("Station outside Austria, skipping it")
-                        continue
-                    (sunnyThere, forecast) = self.sunseeker.checkWeatherAtStation(
-                        station
-                    )
-                    if sunnyThere:
-                        station["forecast"] = forecast
-                        sunny_stations.append(station)
-                        if len(sunny_stations) > self.config.get(
-                            CONF_DESTINATION_NUMBER
-                        ):
-                            break
+        await self.sunseeker.update_train_data()
 
-        except Exception as err:
-            raise UpdateFailed(f"Error communicating with API: {err}")
+        # sunny_stations = self.sunseeker.find_sunny_stations(self.destination_number)
+        # sunny_stations = await self.hass.async_add_executor_job(
+        #     self.sunseeker.find_sunny_stations(self.destination_number)
+        # )
+
+        sunny_stations = await self.sunseeker.async_find_sunny_stations(
+            self.destination_number
+        )
+        # except:
+        #    raise UpdateFailed
         return sunny_stations
 
 
@@ -255,8 +297,8 @@ class WeatherFinderSensor(CoordinatorEntity, SensorEntity):
         self._name = "sunseeker_place_" + str(idx)
         self._state = None
         self.attributes = {}
-        self.icon = "mdi:sun"
-        self.config = config
+        # self.icon = "hass:weather-sunny"
+        # self.config = config
 
         self._attr_unique_id = "sunseeker_place_" + str(idx)
 
@@ -270,14 +312,6 @@ class WeatherFinderSensor(CoordinatorEntity, SensorEntity):
         self.attributes = {
             "forecast": data[self.idx]["forecast"],
         }
-
-        # self._name = self.attributes["startTime"]
-
-        # now = datetime.now()
-        # date_string = now.strftime("%d/%m/%Y")
-        # timestamp_string = date_string + " " + self.attributes["startTime"]
-
-        # self._state = datetime.strptime(timestamp_string, "%d/%m/%Y %H:%M")
 
         self.async_write_ha_state()
 
@@ -305,41 +339,3 @@ class WeatherFinderSensor(CoordinatorEntity, SensorEntity):
     def device_class(self):
         """Return device_class."""
         return "timestamp"
-
-
-class WeatherFinderHelperSensor(CoordinatorEntity, SensorEntity):
-    """OebbSensor."""
-
-    def __init__(self, coordinator: WeatherCoordinator, idx, evaId):
-        """Pass coordinator to CoordinatorEntity."""
-        super().__init__(coordinator)
-        self.idx = idx
-        self.formatted_idx = f"{self.idx:02}"
-        self._name = "oebb_journey_helper_" + str(idx)
-        self._state = None
-
-        self._attr_unique_id = str(evaId) + "_helper_" + str(idx)
-
-    @callback
-    def _handle_coordinator_update(self) -> None:
-        """Handle updated data from the coordinator."""
-        data = self.coordinator.data
-
-        self._state = data["journey"][self.idx]["ti"]
-
-        self.async_write_ha_state()
-
-    @property
-    def name(self):
-        """Return name."""
-        return self._name
-
-    @property
-    def state(self):
-        """Return state."""
-        return self._state
-
-    @property
-    def icon(self):
-        """Return icon."""
-        return "mdi:tram"
